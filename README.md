@@ -10,6 +10,8 @@ An OBS Studio audio source that receives PCM streams from the Shobon Virtual Mix
 
 - このプラグイン：GPL-2.0-or-later（[LICENSE](LICENSE)）。OBS Studio の libobs にリンクするためです
 - 受け渡しの約束（`shared/vmx-ipc/`）：MIT（[shared/vmx-ipc/LICENSE](shared/vmx-ipc/LICENSE)）。本体の repo から写したもので、ここでは直しません（[SOURCE.md](shared/vmx-ipc/SOURCE.md)）
+- 時計のずれの吸収（`shared/vmx-asrc/`）：MIT（[shared/vmx-asrc/LICENSE](shared/vmx-asrc/LICENSE)）。本体の repo から写したもの（[SOURCE.md](shared/vmx-asrc/SOURCE.md)）
+- libsamplerate 0.2.2：BSD-2-Clause。ビルドのときに取得してプラグインに静的リンクします。DLL を配るときは、その著作権表示を同梱します
 - 仮想ミキサーの本体は、このプラグインとは別のプログラムで、共有メモリで音を渡すだけです
 
 このプラグインのコードは、AI のコーディングツール（Claude Code）を使って書いています。
@@ -17,9 +19,10 @@ An OBS Studio audio source that receives PCM streams from the Shobon Virtual Mix
 ## 動き
 
 - 専用のスレッドが 1 ms おきに起き、本体が書いたブロックをすべて OBS へ渡します
-- OBS へ渡す時刻は、最初のブロックの時刻（QPC）に結び付けて、サンプルの位置から続けて作り、固定遅延を足します
+- 本体の時計（オーディオインターフェース）と OBS の時計（PC の時計）は少しずれます。ずれがたまらないよう、音を PC の時計の速さへ少しだけリサンプルします（最大 ±1000 ppm、比率の変化は 1 秒あたり 10 ppm まで）
+- OBS へ渡す時刻は、最初のブロックの時刻（QPC）に固定遅延を足した時刻に結び付け、出したフレーム数から続けて作ります。つなぎ直し・取りこぼし・形式の変化と、ずれが 70 ms を超えたときだけ結び付け直します（OBS では音が飛びます）
 - 本体の起動・停止・再起動は自動で追います（500 ms おきに開き直す）
-- OBS のログに、つながった・止まった・戻ったときと、1 分おきの要約（受け取り、取りこぼし、間に合わなかった数、受け渡しの遅延、時計の差の ppm）を書きます
+- OBS のログに、つながった・止まった・戻ったときと、1 分おきの要約（受け取り、取りこぼし、間に合わなかった数、受け渡しの遅延、ASRC の比率と誤差、結び付け直しの数、時計の差の推定）を書きます。「ずれによる」結び付け直しが 0 のままなら、時計のずれは吸収できています
 
 設定（ソースのプロパティ）：
 
@@ -35,7 +38,7 @@ An OBS Studio audio source that receives PCM streams from the Shobon Virtual Mix
 
 ## ビルド（Windows）
 
-Visual Studio（C++ のデスクトップ開発）、CMake、Git が要ります。「Developer PowerShell for VS」で、この repo の一番上から：
+Visual Studio（C++ のデスクトップ開発）、CMake、Git が要ります。構成のときに GitHub から libsamplerate を取るので、ネットにつながっている必要があります。「Developer PowerShell for VS」で、この repo の一番上から：
 
 1. 対象の一番古い版の OBS のソースを取る（ヘッダーだけ使う。libobs は、自分より新しい版のヘッダーでビルドしたプラグインを読まないため）
 

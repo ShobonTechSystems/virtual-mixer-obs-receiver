@@ -11,12 +11,17 @@
 // 仮想ミキサー（Shobon Virtual Mixer）の本体が共有メモリに書いた PCM を読み、obs_source_output_audio で OBS へ渡す。
 // 受け手の処理（一覧を見て開く・読む・時刻を付ける・再起動を見分ける）は shared/vmx-ipc（MIT）の vmx::ipc::Receiver。
 // このプラグインが使うのは libobs と shared/vmx-ipc だけ。
-// 専用のスレッドが 1 ms おきに起き、たまったブロックをすべて渡す。各ブロックの時刻は、最初のブロックの QPC に結び付けて
-// サンプル位置から連続に作り、固定遅延（設定、既定 10 ms）を足す（virtual-mixer の docs/P3C_OBS_PCM.md §4）。
+// 専用のスレッドが 1 ms おきに起き、たまったブロックをすべて渡す。
+// 本体の時計（主IF）と OBS の時計（QPC）の差は、shared/vmx-asrc（MIT）の StreamAligner でブロックを QPC の速さへ
+// 少しだけリサンプルして吸収する。OBS へ渡す時刻は、最初のブロックの QPC ＋ 固定遅延（設定、既定 10 ms）に結び付け、
+// 出したフレーム数から連続に作る（virtual-mixer の docs/OBS_ASRC.md §4）。
+// 不連続（つなぎ直し・取りこぼし・サンプル位置の飛び・形式の変化）と、ずれが 70 ms を超えたときだけ結び付け直す。
 // OBS のログには、つながった・止まった・戻ったときと、1 分おきの要約だけを書く。
 #include <obs-module.h>
 #include <util/platform.h>
 
+#include "vmx/asrc/block_aligner.hpp"
+#include "vmx/asrc/resampler.hpp"
 #include "vmx/ipc/receiver.hpp"
 
 #include <atomic>
@@ -72,19 +77,32 @@ void ReceiverSource::run() {
   timeBeginPeriod(1);
 #endif
   std::unique_ptr<vmx::ipc::Receiver> rx;
+  vmx::asrc::BlockAligner<vmx::asrc::Resampler> asrc;  // 不連続の見分けと時計のずれの吸収（shared/vmx-asrc）
   std::uint32_t id = 0;
   std::uint64_t lastSummary = os_gettime_ns();
   vmx::ipc::ReceiverStats reported;
-  std::uint64_t reportedRebases = 0;
+  std::uint64_t reportedRebases = 0, reportedAsrcRebases = 0, reportedDriftRebases = 0, reportedStepRebases = 0;
+  std::uint64_t late = 0, reportedLate = 0;  // OBS へ渡した時点で、付けた時刻を過ぎていた
 
-  auto sink = [this](const vmx::ipc::ReceivedBlock& b) {
+  auto sink = [this, &asrc, &late](const vmx::ipc::ReceivedBlock& b) {
+    vmx::asrc::BlockInfo in;
+    in.interleaved = b.interleaved;
+    in.frames = b.frames;
+    in.channels = b.channels;
+    in.sampleRate = b.sampleRate;
+    in.samplePos = b.samplePos;
+    in.qpcNs = b.qpcNs;
+    in.writerDiscontinuity = (b.flags & VMX_IPC_FLAG_DISCONTINUITY) != 0;
+    const vmx::asrc::AlignedChunk c = asrc.push(in);
+    if (c.frames == 0) return;  // リサンプラーの立ち上がり（最初の数十フレーム）
     obs_source_audio audio = {};
-    audio.data[0] = reinterpret_cast<const uint8_t*>(b.interleaved);
-    audio.frames = b.frames;
+    audio.data[0] = reinterpret_cast<const uint8_t*>(c.data);
+    audio.frames = c.frames;
     audio.speakers = b.channels == 1 ? SPEAKERS_MONO : SPEAKERS_STEREO;
     audio.format = AUDIO_FORMAT_FLOAT;  // ch 交互の float
     audio.samples_per_sec = b.sampleRate;
-    audio.timestamp = b.timestampNs;
+    audio.timestamp = c.timestampNs;
+    if (os_gettime_ns() > c.timestampNs) ++late;
     obs_source_output_audio(source, &audio);
   };
 
@@ -95,12 +113,16 @@ void ReceiverSource::run() {
       cfg.fixedDelayNs = std::uint64_t{delayMs.load()} * 1'000'000ull;
       id = cfg.streamId;
       rx = std::make_unique<vmx::ipc::Receiver>(cfg);  // OBS の os_gettime_ns と同じ時計（QPC）
+      asrc.reset(cfg.fixedDelayNs);  // 固定遅延・ストリームが変わった：比率の推定も捨てる
       reported = {};
-      reportedRebases = 0;
+      reportedRebases = reportedAsrcRebases = reportedDriftRebases = reportedStepRebases = 0;
+      late = reportedLate = 0;
       blog(LOG_INFO, "[vmx-receiver] ストリーム %u、固定遅延 %u ms で受けます", id, delayMs.load());
     }
-    auto log = [id](vmx::ipc::ReceiverEvent e, std::uint64_t) {
+    auto log = [id, &asrc](vmx::ipc::ReceiverEvent e, std::uint64_t) {
       blog(LOG_INFO, "[vmx-receiver] ストリーム %u: %s", id, describe(e));
+      if (e == vmx::ipc::ReceiverEvent::Connected || e == vmx::ipc::ReceiverEvent::WriterRestarted)
+        asrc.markDiscontinuity();
     };
     rx->poll(sink, log);
 
@@ -111,16 +133,28 @@ void ReceiverSource::run() {
       if (s.blocks != reported.blocks) {
         double ppm = 0;
         const bool hasPpm = rx->timeline().ppm(ppm);
+        // 「ASRC の結び付け直し」は接続・不連続を含む。「ずれによる」は、そのうち誤差が 70 ms を超えた分、「段差による」は
+        // 落ち着いた後に書き手の時刻が数 ms 以上段になった分（どちらも OBS で音が少し飛ぶ）。
+        // 「時計の差（推定）」と「（参考）推定の結び付け直し」は受け手の Timeline の値で、OBS へ渡す時刻には使っていない
         blog(LOG_INFO,
              "[vmx-receiver] ストリーム %u 1分: 受け取り %llu, 取りこぼし +%llu, 位置の飛び +%llu, 間に合わない +%llu, "
-             "時刻の結び付け直し +%llu, 受け渡し(ms、累計) 中央 %.2f / p99 %.2f / 最大 %.2f, 時計の差 %s%.1f ppm",
+             "受け渡し(ms、累計) 中央 %.2f / p99 %.2f / 最大 %.2f, "
+             "ASRC 比率 %+.1f ppm / 誤差 %+.2f ms / 結び付け直し +%llu（ずれによる +%llu、段差による +%llu）, "
+             "時計の差（推定） %s%.1f ppm, （参考）推定の結び付け直し +%llu",
              id, (unsigned long long)(s.blocks - reported.blocks), (unsigned long long)(s.dropped - reported.dropped),
-             (unsigned long long)(s.positionGaps - reported.positionGaps), (unsigned long long)(s.late - reported.late),
-             (unsigned long long)(rx->timeline().rebases() - reportedRebases), double(s.handoff.quantileNs(0.5)) / 1e6,
-             double(s.handoff.quantileNs(0.99)) / 1e6, double(s.handoff.maxNs()) / 1e6, hasPpm ? "" : "（未推定）",
-             hasPpm ? ppm : 0.0);
+             (unsigned long long)(s.positionGaps - reported.positionGaps), (unsigned long long)(late - reportedLate),
+             double(s.handoff.quantileNs(0.5)) / 1e6, double(s.handoff.quantileNs(0.99)) / 1e6,
+             double(s.handoff.maxNs()) / 1e6, asrc.ppm(), asrc.filteredErrorMs(),
+             (unsigned long long)(asrc.rebases() - reportedAsrcRebases),
+             (unsigned long long)(asrc.driftRebases() - reportedDriftRebases),
+             (unsigned long long)(asrc.stepRebases() - reportedStepRebases), hasPpm ? "" : "（未推定）",
+             hasPpm ? ppm : 0.0, (unsigned long long)(rx->timeline().rebases() - reportedRebases));
         reported = s;
         reportedRebases = rx->timeline().rebases();
+        reportedAsrcRebases = asrc.rebases();
+        reportedDriftRebases = asrc.driftRebases();
+        reportedStepRebases = asrc.stepRebases();
+        reportedLate = late;
       }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));

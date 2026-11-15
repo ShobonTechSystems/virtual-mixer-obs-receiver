@@ -3,12 +3,46 @@
 #   Windows：OBS_SOURCE_DIR（obs-studio のソース。ヘッダーだけ使う）と OBS_IMPORT_LIB（obs.dll から作る obs.lib、tools/make-obs-lib.ps1）
 #   Linux：Ubuntu の libobs-dev（ビルドの確認だけ。Linux の OBS は対象ではない）
 cmake_minimum_required(VERSION 3.20)
-project(vmx_obs_receiver LANGUAGES CXX)
+project(vmx_obs_receiver LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
+# 利用者の PC に Visual C++ ランタイムが無くても動くよう静的リンクする（libsamplerate にも同じ設定を渡す）
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(VMX_OBS_RECEIVER_VERSION "0.1.0" CACHE STRING "プラグインの版")
+# 時計のずれの吸収（ASRC）に使う libsamplerate（BSD-2-Clause）。本体の libs/asrc と同じ 0.2.2 に固定する
+set(VMX_LIBSAMPLERATE_SOURCE_DIR "" CACHE PATH "取得済みの libsamplerate の場所（空なら FetchContent で 0.2.2 を取る）")
+set(LIBSAMPLERATE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(LIBSAMPLERATE_INSTALL OFF CACHE BOOL "" FORCE)
+# libsamplerate は古い CMake の決まり（option が普通の変数を無視する）で書かれているので、CMP0077 を NEW にして渡す
+set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+# 試験は作らず、静的ライブラリにする（DLL を配らずに済むよう）。終わったら元に戻す
+set(_vmx_bt_defined OFF)
+if(DEFINED BUILD_TESTING)
+  set(_vmx_bt_defined ON)
+  set(_vmx_bt ${BUILD_TESTING})
+endif()
+set(_vmx_bsl ${BUILD_SHARED_LIBS})
+set(BUILD_TESTING OFF)
+set(BUILD_SHARED_LIBS OFF)
+if(VMX_LIBSAMPLERATE_SOURCE_DIR)
+  add_subdirectory(${VMX_LIBSAMPLERATE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/libsamplerate EXCLUDE_FROM_ALL)
+else()
+  include(FetchContent)
+  FetchContent_Declare(libsamplerate
+    GIT_REPOSITORY https://github.com/libsndfile/libsamplerate.git
+    GIT_TAG c96f5e3de9c4488f4e6c97f59f5245f22fda22f7)  # 0.2.2
+  FetchContent_MakeAvailable(libsamplerate)
+endif()
+if(_vmx_bt_defined)
+  set(BUILD_TESTING ${_vmx_bt})
+else()
+  unset(BUILD_TESTING)
+endif()
+set(BUILD_SHARED_LIBS ${_vmx_bsl})
+
+set(VMX_OBS_RECEIVER_VERSION "0.2.0" CACHE STRING "プラグインの版")
 set(OBS_SOURCE_DIR "" CACHE PATH "Windows：obs-studio のソース")
 set(OBS_IMPORT_LIB "" CACHE FILEPATH "Windows：obs.dll から作った obs.lib")
 
@@ -41,15 +75,14 @@ if(NOT VMX_OBS_TARGET)
   message(FATAL_ERROR "libobs が見つかりません。Windows は OBS_SOURCE_DIR と OBS_IMPORT_LIB を指定してください（README.md）")
 endif()
 
-add_library(vmx-obs-receiver MODULE src/vmx-obs-receiver.cpp)
-target_include_directories(vmx-obs-receiver PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/shared/vmx-ipc")
+add_library(vmx-obs-receiver MODULE src/vmx-obs-receiver.cpp shared/vmx-asrc/src/resampler.cpp)
+target_include_directories(vmx-obs-receiver PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/shared/vmx-ipc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/shared/vmx-asrc")
 target_compile_definitions(vmx-obs-receiver PRIVATE VMX_OBS_RECEIVER_VERSION="${VMX_OBS_RECEIVER_VERSION}")
-target_link_libraries(vmx-obs-receiver PRIVATE ${VMX_OBS_TARGET} Threads::Threads)
+target_link_libraries(vmx-obs-receiver PRIVATE ${VMX_OBS_TARGET} samplerate Threads::Threads)
 set_target_properties(vmx-obs-receiver PROPERTIES PREFIX "")
 if(MSVC)
   target_compile_options(vmx-obs-receiver PRIVATE /utf-8 /W4 /permissive-)
-  # 利用者の PC に Visual C++ ランタイムが無くても動くよう静的リンクする
-  set_property(TARGET vmx-obs-receiver PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   target_link_libraries(vmx-obs-receiver PRIVATE winmm)
 else()
   target_compile_options(vmx-obs-receiver PRIVATE -Wall -Wextra -Wconversion -Wshadow)
