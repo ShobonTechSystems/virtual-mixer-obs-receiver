@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
+﻿﻿# SPDX-License-Identifier: GPL-2.0-or-later
 # インストールされている OBS の obs.dll から、リンク用の obs.lib を作る（README.md「ビルド（Windows）」）。
 # 「Developer PowerShell for VS」で実行する（dumpbin と lib を使うため）。
 #   powershell -ExecutionPolicy Bypass -File tools\make-obs-lib.ps1 [-ObsDll <obs.dll のパス>] [-OutDir obs-lib]
