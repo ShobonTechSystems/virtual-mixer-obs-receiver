@@ -26,11 +26,14 @@ class Resampler {
   // 入力が出力に出るまでの遅れ（入力のフレーム、比率 1 のとき）。init で測る
   double latencyFrames() const { return latency_; }
   std::uint32_t channels() const { return channels_; }
+  // 使われずに捨てた入力のフレーム（出力の場所が足りない・処理の失敗）。0 のはず
+  std::uint64_t droppedInputFrames() const { return droppedInput_; }
 
  private:
   void* state_ = nullptr;  // SRC_STATE*
   std::uint32_t channels_ = 0;
   double latency_ = 0.0;
+  std::uint64_t droppedInput_ = 0;
 };
 
 }  // namespace vmx::asrc

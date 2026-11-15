@@ -26,6 +26,7 @@ bool Resampler::init(std::uint32_t channels) {
   std::vector<float> in(std::size_t{n} * channels, 0.0f), out(std::size_t{n + 64} * channels, 0.0f);
   const std::uint32_t got = process(in.data(), n, 1.0, out.data(), n + 64);
   latency_ = static_cast<double>(n) - static_cast<double>(got);
+  droppedInput_ = 0;
   reset();
   return true;
 }
@@ -44,7 +45,12 @@ std::uint32_t Resampler::process(const float* in, std::uint32_t inFrames, double
   d.output_frames = static_cast<long>(outCapacityFrames);
   d.src_ratio = ratio;
   d.end_of_input = 0;
-  if (src_process(static_cast<SRC_STATE*>(state_), &d) != 0) return 0;
+  if (src_process(static_cast<SRC_STATE*>(state_), &d) != 0) {
+    droppedInput_ += inFrames;
+    return 0;
+  }
+  // 出力の場所が足りないと、入力の残りは使われない（呼ぶ側の容量の誤り。数えて分かるようにする）
+  if (d.input_frames_used < d.input_frames) droppedInput_ += static_cast<std::uint64_t>(d.input_frames - d.input_frames_used);
   return static_cast<std::uint32_t>(d.output_frames_gen);
 }
 

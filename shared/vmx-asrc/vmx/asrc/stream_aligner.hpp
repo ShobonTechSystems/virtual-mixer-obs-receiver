@@ -3,6 +3,9 @@
 //   出力の時刻：最初のブロック（と結び付け直しの後）で「ブロックの QPC ＋ 固定遅延」に結び付け、以後は出したフレーム数から
 //   連続に作る。誤差＝出力の最後のフレームの時刻 −（そのフレームに当たる入力の QPC ＋ 固定遅延）を DriftController に渡す。
 //   不連続・誤差が大きすぎる（hardResyncMs 以上）ときは、リサンプラーの状態を捨てて結び付け直す（比率の推定は残す）
+//   いったん落ち着いた後（均した誤差が settleMs 未満の状態が settleHoldSec 続いた後）に、均した誤差が stepResyncMs を
+//   超えたら、時刻の段差（書き手の一時的な止まりなど）とみなして結び付け直す。比率の変化の上限（10 ppm/s）のもとでは
+//   数 ms を超える段差を制御で戻すと、大きく振れて何分も収まらないため（自己レビューの指摘、試験「段差」）
 // R はリサンプラー（Resampler、または試験用の模型）。process(in, frames, ratio, out, cap) と latencyFrames() を持つ。
 // 確保は prepare のときだけ。
 //
@@ -22,6 +25,9 @@ struct StreamAlignerConfig {
   double sampleRate = 48000.0;
   std::uint64_t fixedDelayNs = 10'000'000;
   double hardResyncMs = 70.0;  // OBS の TS_SMOOTHING_THRESHOLD と同じ
+  double stepResyncMs = 3.0;   // 落ち着いた後の、均した誤差の上限
+  double settleMs = 1.0;
+  double settleHoldSec = 30.0;
   DriftControllerConfig control{};
 };
 
@@ -69,7 +75,16 @@ class StreamAligner {
       needAnchor_ = true;
     } else {
       // 経過時間はフレーム数から測る（ブロックの QPC の揺れを、比率の変化の速さに持ち込まない）
-      ctl_.update(errMs, static_cast<double>(frames) / cfg_.sampleRate);
+      const double dt = static_cast<double>(frames) / cfg_.sampleRate;
+      ctl_.update(errMs, dt);
+      const double f = std::fabs(ctl_.filteredErrorMs());
+      if (!settled_) {
+        calmSec_ = f < cfg_.settleMs ? calmSec_ + dt : 0.0;
+        if (calmSec_ >= cfg_.settleHoldSec) settled_ = true;
+      } else if (f >= cfg_.stepResyncMs) {
+        ++stepRebases_;
+        needAnchor_ = true;
+      }
     }
     if (needAnchor_) {
       anchored_ = false;
@@ -82,7 +97,9 @@ class StreamAligner {
   double lastErrorMs() const { return lastErrorMs_; }
   double filteredErrorMs() const { return ctl_.filteredErrorMs(); }
   std::uint64_t rebases() const { return rebases_; }            // 結び付けた回数（最初を含む）
-  std::uint64_t driftRebases() const { return driftRebases_; }  // そのうち、誤差が大きすぎた回数
+  std::uint64_t driftRebases() const { return driftRebases_; }  // そのうち、誤差が hardResyncMs 以上になった回数
+  std::uint64_t stepRebases() const { return stepRebases_; }    // そのうち、落ち着いた後の時刻の段差
+  bool settled() const { return settled_; }
 
  private:
   void anchor(std::uint64_t blockQpcNs) {
@@ -104,9 +121,9 @@ class StreamAligner {
   DriftController ctl_;
   std::vector<float> out_;
   std::uint32_t channels_ = 0, capacity_ = 0;
-  bool anchored_ = false, needAnchor_ = false;
-  double baseNs_ = 0.0, lastErrorMs_ = 0.0;
-  std::uint64_t outFrames_ = 0, rebases_ = 0, driftRebases_ = 0;
+  bool anchored_ = false, needAnchor_ = false, settled_ = false;
+  double baseNs_ = 0.0, lastErrorMs_ = 0.0, calmSec_ = 0.0;
+  std::uint64_t outFrames_ = 0, rebases_ = 0, driftRebases_ = 0, stepRebases_ = 0;
 };
 
 }  // namespace vmx::asrc
